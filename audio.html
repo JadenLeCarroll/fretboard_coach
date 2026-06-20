@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>audio engine test</title>
+    <style>
+        body { 
+            background: #121212; 
+            color: #00FF00; 
+            display: flex; 
+            flex-direction: column; 
+            align-items: center; 
+            font-family: monospace; 
+            padding-top: 50px;
+        }
+        button {
+            padding: 15px 30px;
+            font-size: 18px;
+            background: #333;
+            color: white;
+            border: none;
+            cursor: pointer;
+            border-radius: 5px;
+        }
+        #pitch-display {
+            font-size: 64px;
+            margin-top: 40px;
+        }
+        #note-display {
+            font-size: 32px;
+            color: white;
+        }
+    </style>
+</head>
+<body>
+    <button id="start-btn">enable microphone</button>
+    <div id="pitch-display">-- hz</div>
+    <div id="note-display">--</div>
+
+    <script src="audio.js"></script>
+</body>
+</html>
