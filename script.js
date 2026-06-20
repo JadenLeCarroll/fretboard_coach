@@ -1,262 +1,255 @@
-import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3";
+// ==========================================
+// 1. GLOBALS & DOM ELEMENTS
+// ==========================================
+const video = document.getElementById('video'); // Assuming video element has id="video"
+const canvas = document.getElementById('output_canvas'); // Assuming your canvas has id="output_canvas"
+const ctx = canvas.getContext('2d');
 
-const video = document.getElementById("video");
-const canvas = document.getElementById("output_canvas");
-const ctx = canvas.getContext("2d");
-const statusText = document.getElementById("status");
+let yoloSession = null;
+let isDetecting = false;
+let fretboardCorners = null; // Will hold [TopLeft, TopRight, BottomRight, BottomLeft]
+let smoothedBox = null; // Will hold the smoothed bounding box
+let handLandmarks = null; // For MediaPipe
 
-let handLandmarker;
-let lastVideoTime = -1;
+// ==========================================
+// 2. INITIALIZATION (CAMERA & AI)
+// ==========================================
 
-// --- MUSIC & GRID VARIABLES ---
-const CHORD_DICTIONARIES = {
-    "A Minor": [
-        { string: 3, fret: 2, label: "M" }, 
-        { string: 2, fret: 2, label: "R" }, 
-        { string: 1, fret: 1, label: "I" }  
-    ],
-    "C Major": [
-        { string: 4, fret: 3, label: "R" },  
-        { string: 3, fret: 2, label: "M" }, 
-        { string: 1, fret: 1, label: "I" }  
-    ]
-};
-
-const ACTIVE_CHORD = "A Minor";
-const targetNotes = CHORD_DICTIONARIES[ACTIVE_CHORD];
-
-let calibrationPoints = [];
-const flatW = 500;
-const flatH = 200;
-const fretWidth = flatW / 5;
-const stringHeight = flatH / 5;
-let homographyMatrix = null;
-
-// --- SMOOTHING VARIABLES ---
-let previousPositions = { "I": null, "M": null, "R": null };
-const smoothing = 0.6; 
-
-// --- MATH ENGINES ---
-function calculateJointAngle(a, b, c) {
-    const ba = [a.x - b.x, a.y - b.y, a.z - b.z];
-    const bc = [c.x - b.x, c.y - b.y, c.z - b.z];
-    const dotProduct = ba[0]*bc[0] + ba[1]*bc[1] + ba[2]*bc[2];
-    const magBA = Math.sqrt(ba[0]**2 + ba[1]**2 + ba[2]**2);
-    const magBC = Math.sqrt(bc[0]**2 + bc[1]**2 + bc[2]**2);
-    if (magBA * magBC === 0) return 0;
-    return Math.acos(dotProduct / (magBA * magBC)) * (180 / Math.PI);
-}
-
-// Replaces OpenCV's getPerspectiveTransform
-function getPerspectiveTransform(src, dst) {
-    let a = [];
-    for (let i = 0; i < 4; i++) {
-        a.push([src[i].x, src[i].y, 1, 0, 0, 0, -src[i].x * dst[i].x, -src[i].y * dst[i].x]);
-        a.push([0, 0, 0, src[i].x, src[i].y, 1, -src[i].x * dst[i].y, -src[i].y * dst[i].y]);
-    }
-    let b = [];
-    for (let i = 0; i < 4; i++) {
-        b.push(dst[i].x); b.push(dst[i].y);
-    }
-    for (let i = 0; i < 8; i++) {
-        let maxRow = i;
-        for (let k = i + 1; k < 8; k++) if (Math.abs(a[k][i]) > Math.abs(a[maxRow][i])) maxRow = k;
-        let temp = a[i]; a[i] = a[maxRow]; a[maxRow] = temp;
-        let tempB = b[i]; b[i] = b[maxRow]; b[maxRow] = tempB;
-        for (let k = i + 1; k < 8; k++) {
-            let c = -a[k][i] / a[i][i];
-            for (let j = i; j < 8; j++) {
-                if (i === j) a[k][j] = 0;
-                else a[k][j] += c * a[i][j];
-            }
-            b[k] += c * b[i];
-        }
-    }
-    let x = new Array(8);
-    for (let i = 7; i >= 0; i--) {
-        x[i] = b[i];
-        for (let k = i + 1; k < 8; k++) x[i] -= a[i][k] * x[k];
-        x[i] = x[i] / a[i][i];
-    }
-    return x;
-}
-
-// Replaces OpenCV's perspectiveTransform
-function warpPoint(x, y, matrix) {
-    let denominator = matrix[6] * x + matrix[7] * y + 1;
-    return {
-        x: (matrix[0] * x + matrix[1] * y + matrix[2]) / denominator,
-        y: (matrix[3] * x + matrix[4] * y + matrix[5]) / denominator
-    };
-}
-
-// --- MOUSE LISTENERS ---
-canvas.addEventListener('mousedown', (e) => {
-    const rect = canvas.getBoundingClientRect();
-    // Invert X because the canvas is mirrored via CSS
-    const clickX = canvas.width - ((e.clientX - rect.left) * (canvas.width / rect.width));
-    const clickY = (e.clientY - rect.top) * (canvas.height / rect.height);
-
-    if (calibrationPoints.length === 4) calibrationPoints = []; // Reset on 5th click
-    calibrationPoints.push({ x: clickX, y: clickY });
-
-    if (calibrationPoints.length === 4) {
-        const dstPoints = [
-            { x: 0, y: 0 }, { x: flatW, y: 0 }, 
-            { x: flatW, y: flatH }, { x: 0, y: flatH }
-        ];
-        homographyMatrix = getPerspectiveTransform(calibrationPoints, dstPoints);
-    } else {
-        homographyMatrix = null;
-    }
-});
-
-document.addEventListener('keydown', (e) => {
-    if (e.key === 'c') {
-        calibrationPoints = [];
-        homographyMatrix = null;
-    }
-});
-
-// --- AI PIPELINE ---
-async function initializeAI() {
-    const vision = await FilesetResolver.forVisionTasks(
-        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm"
-    );
-    handLandmarker = await HandLandmarker.createFromOptions(vision, {
-        baseOptions: {
-            modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
-            delegate: "GPU"
-        },
-        runningMode: "VIDEO",
-        numHands: 1,
-        minHandDetectionConfidence: 0.75,
-        minHandPresenceConfidence: 0.75,
-        minTrackingConfidence: 0.75
-    });
-    statusText.innerText = "System Ready. Click 4 corners of fretboard to calibrate.";
-    startCamera();
-}
-
+// Boot up the webcam
 async function startCamera() {
     try {
         const stream = await navigator.mediaDevices.getUserMedia({
-            video: { width: 640, height: 480 }
+            video: { width: 1280, height: 720 }
         });
         video.srcObject = stream;
-        video.addEventListener("loadeddata", predictWebcam);
-    } catch (err) {
-        statusText.innerText = "Error: Camera access denied.";
-        console.error(err);
-    }
-}
-
-async function predictWebcam() {
-    if (video.currentTime !== lastVideoTime) {
-        lastVideoTime = video.currentTime;
-        const results = handLandmarker.detectForVideo(video, performance.now());
+        video.play();
         
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-        // Draw Calibration Points
-        ctx.fillStyle = "orange";
-        calibrationPoints.forEach(pt => {
-            ctx.beginPath();
-            ctx.arc(pt.x, pt.y, 5, 0, 2 * Math.PI);
-            ctx.fill();
-        });
-
-        // Draw Calibration Polygon
-        if (calibrationPoints.length === 4) {
-            ctx.strokeStyle = "orange";
-            ctx.lineWidth = 2;
-            ctx.beginPath();
-            ctx.moveTo(calibrationPoints[0].x, calibrationPoints[0].y);
-            for (let i = 1; i < 4; i++) ctx.lineTo(calibrationPoints[i].x, calibrationPoints[i].y);
-            ctx.closePath();
-            ctx.stroke();
-        }
-
-        let satisfiedTargets = new Set();
-
-        if (results.landmarks && results.landmarks.length > 0) {
-            const landmarks = results.landmarks[0]; 
-            
-            const fingersToTrack = [
-                { label: "I", mcp: 5, pip: 6, tip: 8 },
-                { label: "M", mcp: 9, pip: 10, tip: 12 },
-                { label: "R", mcp: 13, pip: 14, tip: 16 }
-            ];
-
-            fingersToTrack.forEach(finger => {
-                const mcp = landmarks[finger.mcp];
-                const pip = landmarks[finger.pip];
-                const tip = landmarks[finger.tip];
-
-                const rawCx = tip.x * canvas.width;
-                const rawCy = tip.y * canvas.height;
-
-                let cx, cy;
-                if (!previousPositions[finger.label]) {
-                    cx = rawCx; cy = rawCy;
-                } else {
-                    const px = previousPositions[finger.label].x;
-                    const py = previousPositions[finger.label].y;
-                    cx = (rawCx * (1 - smoothing)) + (px * smoothing);
-                    cy = (rawCy * (1 - smoothing)) + (py * smoothing);
-                }
-                previousPositions[finger.label] = { x: cx, y: cy };
-
-                const bendAngle = calculateJointAngle(mcp, pip, tip);
-                const isPressing = bendAngle < 150.0;
-
-                ctx.beginPath();
-                ctx.arc(cx, cy, 10, 0, 2 * Math.PI);
-                ctx.fillStyle = isPressing ? "#00FF00" : "#FF0000";
-                ctx.fill();
-
-                // Process through Homography Matrix
-                if (isPressing && homographyMatrix) {
-                    const flatPt = warpPoint(cx, cy, homographyMatrix);
-                    
-                    if (flatPt.x >= 0 && flatPt.x <= flatW && flatPt.y >= 0 && flatPt.y <= flatH) {
-                        const fretIdx = Math.floor(flatPt.x / fretWidth);
-                        const stringIdx = 5 - Math.floor(flatPt.y / stringHeight);
-                        
-                        targetNotes.forEach((target, i) => {
-                            if (target.string === stringIdx && target.fret === fretIdx && target.label === finger.label) {
-                                satisfiedTargets.add(i);
-                            }
-                        });
-                    }
-                }
-            });
-        }
-
-        // Render Status UI
-        if (homographyMatrix) {
-            const allPressed = satisfiedTargets.size === targetNotes.length;
-            const status = allPressed ? `${ACTIVE_CHORD}: VALIDATED` : `${ACTIVE_CHORD}: INCOMPLETE (${satisfiedTargets.size}/${targetNotes.length})`;
-            
-            ctx.save();
-            
-            // The canvas is mirrored via CSS, so we "un-mirror" the drawing context 
-            // specifically for the UI box so the text reads correctly.
-            ctx.translate(canvas.width, 0); 
-            ctx.scale(-1, 1); 
-            
-            ctx.fillStyle = "black";
-            ctx.fillRect(20, 20, 300, 40);
-            
-            ctx.fillStyle = allPressed ? "#00FF00" : "#FF0000";
-            ctx.font = "20px monospace";
-            ctx.fillText(status, 30, 45);
-            
-            ctx.restore();
-        }
+        video.onloadeddata = () => {
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            requestAnimationFrame(renderLoop);
+        };
+    } catch (err) {
+        console.error("Camera access denied:", err);
     }
-    window.requestAnimationFrame(predictWebcam);
 }
 
-initializeAI();
+// Boot up the YOLO ONNX Model
+async function initAiEngine() {
+    console.log("Loading YOLO engine...");
+    try {
+        // USING WASM: This bypasses the WebGL clash with MediaPipe on your Mac
+        yoloSession = await ort.InferenceSession.create('./best.onnx', {
+            executionProviders: ['wasm']
+        });
+        console.log("YOLO engine successfully armed and loaded via WASM.");
+    } catch (error) {
+        console.error("Failed to boot ONNX runtime:", error);
+    }
+}
+
+// Boot up MediaPipe Hands (Standard Setup)
+// Note: Assuming you have the MediaPipe CDN links in your index.html
+if (typeof Hands !== 'undefined') {
+    const hands = new Hands({
+        locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+    });
+    hands.setOptions({
+        maxNumHands: 2,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.5,
+        minTrackingConfidence: 0.5
+    });
+    hands.onResults((results) => {
+        if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+            handLandmarks = results.multiHandLandmarks[0];
+        } else {
+            handLandmarks = null;
+        }
+    });
+
+    // Send frames to MediaPipe
+    async function sendToMediaPipe() {
+        if (!video.paused && !video.ended) {
+            await hands.send({ image: video });
+        }
+        setTimeout(sendToMediaPipe, 1000 / 30); // 30 FPS target
+    }
+    video.addEventListener('loadeddata', sendToMediaPipe);
+}
+
+// ==========================================
+// 3. THE YOLO VISION PIPELINE
+// ==========================================
+
+async function detectGuitarNeck() {
+    if (!yoloSession || isDetecting || video.paused || video.ended) return;
+    isDetecting = true;
+
+    try {
+        // STEP A: PREPROCESSING (Canvas to Tensor)
+        // YOLO requires a 640x640 input
+        const inputSize = 640;
+        const offscreenCanvas = document.createElement('canvas');
+        offscreenCanvas.width = inputSize;
+        offscreenCanvas.height = inputSize;
+        const offCtx = offscreenCanvas.getContext('2d');
+        
+        // Draw the current video frame to the 640x640 canvas
+        offCtx.drawImage(video, 0, 0, inputSize, inputSize);
+        const imgData = offCtx.getImageData(0, 0, inputSize, inputSize).data;
+
+        // Create the flat Float32Array [1, 3, 640, 640]
+        const floatData = new Float32Array(3 * inputSize * inputSize);
+        
+        // Planar format conversion: RRR... GGG... BBB... and normalize to 0.0 - 1.0
+        for (let i = 0; i < inputSize * inputSize; i++) {
+            floatData[i] = imgData[i * 4] / 255.0;                         // Red
+            floatData[i + inputSize * inputSize] = imgData[i * 4 + 1] / 255.0;     // Green
+            floatData[i + 2 * inputSize * inputSize] = imgData[i * 4 + 2] / 255.0; // Blue
+        }
+
+        const tensor = new ort.Tensor('float32', floatData, [1, 3, inputSize, inputSize]);
+
+        // STEP B: RUN INFERENCE
+        // Pass the tensor to the ONNX model. The input name is usually 'images'
+        const results = await yoloSession.run({ images: tensor });
+        const outputData = results.output0.data; // YOLOv8/11 outputs [1, 5, 8400]
+        
+        // STEP C: POSTPROCESSING (Decoding the Bounding Box)
+        let maxConf = 0;
+        let bestBox = null;
+        const numAnchors = 8400;
+
+        // Scan through all 8400 candidate boxes to find the one with the highest confidence
+        for (let i = 0; i < numAnchors; i++) {
+            const confidence = outputData[4 * numAnchors + i]; // Index 4 holds the score
+            
+            if (confidence > maxConf && confidence > 0.5) { // 50% confidence threshold
+                maxConf = confidence;
+                const xc = outputData[0 * numAnchors + i];
+                const yc = outputData[1 * numAnchors + i];
+                const w = outputData[2 * numAnchors + i];
+                const h = outputData[3 * numAnchors + i];
+                bestBox = { xc, yc, w, h, confidence };
+            }
+        }
+
+        // If we found a guitar neck, apply stabilization math before drawing
+        if (bestBox) {
+            if (!smoothedBox) {
+                // First detection: lock it in immediately
+                smoothedBox = bestBox; 
+            } else {
+                // Check for occlusion (did the box suddenly shrink because a hand is over it?)
+                const areaOld = smoothedBox.w * smoothedBox.h;
+                const areaNew = bestBox.w * bestBox.h;
+                const sizeChange = Math.abs(areaOld - areaNew) / areaOld;
+
+                // If the box shrinks/grows by more than 15% instantly, reject the size change
+                if (sizeChange > 0.15) {
+                    bestBox.w = smoothedBox.w;
+                    bestBox.h = smoothedBox.h;
+                }
+
+                // Apply Exponential Moving Average (EMA) to kill the jitter
+                const alpha = 0.15; // 15% trust in new frame, 85% trust in previous frame
+                smoothedBox.xc = (alpha * bestBox.xc) + ((1 - alpha) * smoothedBox.xc);
+                smoothedBox.yc = (alpha * bestBox.yc) + ((1 - alpha) * smoothedBox.yc);
+                smoothedBox.w = (alpha * bestBox.w) + ((1 - alpha) * smoothedBox.w);
+                smoothedBox.h = (alpha * bestBox.h) + ((1 - alpha) * smoothedBox.h);
+            }
+
+            // Scale the stabilized coordinates back to the main canvas size
+            const scaleX = canvas.width / inputSize;
+            const scaleY = canvas.height / inputSize;
+
+            const xMin = (smoothedBox.xc - smoothedBox.w / 2) * scaleX;
+            const yMin = (smoothedBox.yc - smoothedBox.h / 2) * scaleY;
+            const xMax = (smoothedBox.xc + smoothedBox.w / 2) * scaleX;
+            const yMax = (smoothedBox.yc + smoothedBox.h / 2) * scaleY;
+
+            // Generate the rock-solid homography matrix source points
+            fretboardCorners = [
+                { x: xMin, y: yMin }, 
+                { x: xMax, y: yMin }, 
+                { x: xMax, y: yMax }, 
+                { x: xMin, y: yMax }  
+            ];
+        } else {
+            // If the AI completely loses the guitar for multiple frames, gracefully let it go
+            smoothedBox = null;
+            fretboardCorners = null; 
+        }
+    } catch (error) {
+        console.error("Error in detectGuitarNeck:", error);
+    } finally {
+        isDetecting = false;
+    }
+}
+
+// ==========================================
+// 4. MAIN RENDER LOOP & GRAPHICS
+// ==========================================
+
+function renderLoop() {
+    // 1. draw the raw video frame at full speed (60fps)
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+    // 2. draw the automated yolo coordinates smoothly
+    if (fretboardCorners) {
+        ctx.strokeStyle = '#00FF00';
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.moveTo(fretboardCorners[0].x, fretboardCorners[0].y);
+        ctx.lineTo(fretboardCorners[1].x, fretboardCorners[1].y);
+        ctx.lineTo(fretboardCorners[2].x, fretboardCorners[2].y);
+        ctx.lineTo(fretboardCorners[3].x, fretboardCorners[3].y);
+        ctx.closePath();
+        ctx.stroke();
+    }
+
+    // 3. draw mediapipe hand landmarks
+    if (handLandmarks) {
+        ctx.fillStyle = '#FF0000';
+        for (let i = 0; i < handLandmarks.length; i++) {
+            const px = handLandmarks[i].x * canvas.width;
+            const py = handLandmarks[i].y * canvas.height;
+            ctx.beginPath();
+            ctx.arc(px, py, 5, 0, 2 * Math.PI);
+            ctx.fill();
+        }
+    }
+
+    // loop the graphics instantly
+    requestAnimationFrame(renderLoop);
+}
+
+// ==========================================
+// 5. DECOUPLED AI LOOP
+// ==========================================
+
+async function aiLoop() {
+    // run the heavy math
+    await detectGuitarNeck();
+    
+    // wait 100 milliseconds before running it again (runs at ~10 fps)
+    // this lets the main thread breathe so the video stays smooth
+    setTimeout(aiLoop, 100);
+}
+
+// boot everything when the script loads
+window.addEventListener('DOMContentLoaded', async () => {
+    await initAiEngine();
+    await startCamera();
+    
+    // start the slow ai engine completely separate from the fast graphics
+    aiLoop(); 
+});
+
+// Boot everything when the script loads
+window.addEventListener('DOMContentLoaded', () => {
+    initAiEngine();
+    startCamera();
+});
